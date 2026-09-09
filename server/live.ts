@@ -75,11 +75,17 @@ if (!process.env.GEMINI_API_KEY) {
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Only needed to hang up the PSTN leg when the agent ends the interview.
-// Absent in local browser-only development, so keep it optional.
+// Absent in local browser-only development, so keep it optional. Supports
+// API-key auth (TWILIO_API_KEY/TWILIO_API_SECRET) so the server never needs
+// the account auth token, with auth-token auth as the fallback.
 const twilioClient =
-  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-    : null;
+  process.env.TWILIO_API_KEY && process.env.TWILIO_API_SECRET && process.env.TWILIO_ACCOUNT_SID
+    ? twilio(process.env.TWILIO_API_KEY, process.env.TWILIO_API_SECRET, {
+        accountSid: process.env.TWILIO_ACCOUNT_SID,
+      })
+    : process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+      ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+      : null;
 
 // ------- HTTP server (health only) -------
 
