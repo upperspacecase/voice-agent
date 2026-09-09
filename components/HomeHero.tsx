@@ -24,8 +24,9 @@ export const HomeHero: React.FC = () => {
             <span aria-hidden className="material-symbols-outlined mt-0.5 text-[16px]">
               schedule
             </span>
-            {PROMISES.freeOfferLabel} — one-page report {PROMISES.freeSlaLabel}.
-            Want the whole operation mapped? The Full Assessment is $497.
+            One workflow. One task. One fix. Free, with a one-page report{" "}
+            {PROMISES.freeSlaLabel} — and a $497 Full Assessment when you want
+            the whole operation mapped.
           </p>
         </div>
 

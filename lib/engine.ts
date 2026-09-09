@@ -16,6 +16,7 @@ import type {
 } from "./assessment-schema";
 import { logEvent } from "./events";
 import { sendAdminNotification, sendFreeReportDelivery } from "./email";
+import { getVerifiedTools, matchVerifiedTool, type VerifiedTool } from "./tool-allowlist";
 
 const REPORT_MODEL = process.env.REPORT_MODEL ?? "gemini-3-flash-preview";
 
@@ -76,6 +77,7 @@ function buildPrompt(args: {
   teamSize: string | null;
   country: string | null;
   observations: WorkflowObservation[];
+  verifiedTools: VerifiedTool[];
 }): string {
   const obs = args.observations
     .map(
@@ -98,11 +100,22 @@ function buildPrompt(args: {
     "",
     "Select the ONE task inside this workflow where a change creates the most recoverable time for the least setup effort, and produce a recommendation.",
     "",
+    "",
+    args.verifiedTools.length
+      ? [
+          "Verified tools for this workflow (pricing confirmed against the live pricing page; PREFER one of these when a tool fits):",
+          ...args.verifiedTools.map(
+            (t) =>
+              `- ${t.name}: ${t.fit}. Plans: ${t.plans.map((p) => `${p.plan} $${p.monthlyUsd}/mo (${p.note})`).join("; ")}. Free trial: ${t.freeTrial ?? "none"}.`,
+          ),
+        ].join("\n")
+      : "No verified tools are on file for this workflow.",
+    "",
     "Hard rules:",
     "- Use ONLY what the customer said. Do not invent industry averages, statistics, or facts about their business.",
     "- customerQuotes must be verbatim phrases from their answers, never paraphrased.",
     "- recoverable hours must be a defensible reduction of THEIR stated time, expressed as a range. If they were unsure of their time, keep the range small and set confidence to low.",
-    "- If a tool is recommended it must be a real, currently available product appropriate for their country. If unsure of a specific product, describe the approach generically and say so.",
+    "- Prefer a verified tool from the list above when one fits the problem. Recommending a tool NOT on the list is allowed only when none fits — and then describe the approach; its pricing will be shown as unverified.",
     "- Do not promise revenue gains. Time only.",
     "- The recommendation must be small enough to start this week.",
   ].join("\n");
@@ -142,12 +155,14 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
   if (observations.length === 0) throw new Error("no observations");
 
   const locale = (a.locale as { country?: string | null; currency?: string } | undefined) ?? {};
+  const verifiedTools = await getVerifiedTools(workflow.id);
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
   const prompt = buildPrompt({
     workflowLabel: workflow.label,
     teamSize: (a.teamSize as string | null) ?? null,
     country: locale.country ?? null,
     observations,
+    verifiedTools,
   });
 
   const result = await ai.models.generateContent({
@@ -166,18 +181,29 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
   const { range: recoverable, clampedHard } = clampRecoverable(out, stated);
   const weeks = DEFAULT_WORKING_WEEKS;
   const hourly = DEFAULT_LOADED_HOURLY_USD;
-  const toolAnnual = Math.max(0, out.recurringMonthlyCostUsd) * 12;
-  const annual = {
-    minUsd: Math.max(0, Math.round(recoverable.minHoursPerWeek * weeks * hourly - toolAnnual)),
-    maxUsd: Math.max(0, Math.round(recoverable.maxHoursPerWeek * weeks * hourly - toolAnnual)),
+
+  // Price truth: only a verified allowlist entry may put a dollar figure on a
+  // tool. A model-guessed price is discarded, and the annual value is
+  // recomputed without the unverified cost rather than shipping a number
+  // built on one.
+  const verified = matchVerifiedTool(out.toolOrApproach, verifiedTools);
+  const verifiedMonthly = verified
+    ? Math.min(...verified.plans.map((p) => p.monthlyUsd))
+    : null;
+  const effectiveMonthly = verified ? verifiedMonthly! : 0;
+  const effectiveToolAnnual = effectiveMonthly * 12;
+  const annualFinal = {
+    minUsd: Math.max(0, Math.round(recoverable.minHoursPerWeek * weeks * hourly - effectiveToolAnnual)),
+    maxUsd: Math.max(0, Math.round(recoverable.maxHoursPerWeek * weeks * hourly - effectiveToolAnnual)),
   };
 
   const flagReasons: string[] = [];
   if (out.confidenceLevel === "low") flagReasons.push("low_confidence");
-  if (annual.maxUsd > FLAG_ANNUAL_MAX_USD) flagReasons.push("implausible_annual_value");
+  if (annualFinal.maxUsd > FLAG_ANNUAL_MAX_USD) flagReasons.push("implausible_annual_value");
   if (clampedHard) flagReasons.push("model_overshot_stated_time");
   if ((out.disposition === "automate" || out.disposition === "ai") && !out.toolOrApproach.trim())
     flagReasons.push("automation_without_approach");
+  if (out.toolOrApproach.trim() && !verified) flagReasons.push("tool_not_verified");
   const flagged = flagReasons.length > 0;
 
   const recommendation: EngineRecommendation = {
@@ -187,21 +213,23 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
     currentState: out.currentStateSummary,
     disposition: out.disposition,
     recommendation: out.recommendation,
-    toolOrApproach: out.toolOrApproach.trim() || null,
+    toolOrApproach: verified ? verified.name : out.toolOrApproach.trim() || null,
     setupSteps: out.setupSteps.slice(0, 5),
     cost: {
       oneTimeUsd: null,
-      recurringMonthlyUsd: out.recurringMonthlyCostUsd > 0 ? out.recurringMonthlyCostUsd : null,
-      sourceDate: null,
+      recurringMonthlyUsd: verifiedMonthly,
+      sourceDate: verified ? verified.sourceDate : null,
     },
     impact: {
       recoverableRange: recoverable,
-      annualValueRange: annual,
+      annualValueRange: annualFinal,
       revenueUpsideNote: null,
     },
     evidence: {
       customerQuotes: out.customerQuotes.slice(0, 4),
-      externalSources: [],
+      externalSources: verified
+        ? [{ title: `${verified.name} pricing`, url: verified.pricingUrl, date: verified.sourceDate }]
+        : [],
       benchmarkState: "self_reported",
     },
     confidence: { level: out.confidenceLevel, reason: out.confidenceReason },
@@ -297,7 +325,13 @@ function renderMarkdown(args: {
     "",
     `## Recommendation — ${r.disposition.replace("_", " ")}`,
     r.recommendation,
-    r.toolOrApproach ? `\nTool or approach: ${r.toolOrApproach}` : "",
+    r.toolOrApproach
+      ? `\nTool or approach: ${r.toolOrApproach}${
+          r.cost.recurringMonthlyUsd != null && r.cost.sourceDate
+            ? ` — from $${r.cost.recurringMonthlyUsd}/mo (pricing verified ${r.cost.sourceDate})`
+            : " — pricing not verified; check the vendor's site"
+        }`
+      : "",
     "",
     `Recoverable (estimate): ${r.impact.recoverableRange.minHoursPerWeek}-${r.impact.recoverableRange.maxHoursPerWeek} hrs/week`,
     `Annual value (estimate): $${r.impact.annualValueRange.minUsd.toLocaleString()}-$${r.impact.annualValueRange.maxUsd.toLocaleString()}`,
