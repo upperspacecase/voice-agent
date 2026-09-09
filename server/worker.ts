@@ -47,10 +47,31 @@ export function startWorker(): void {
   void loop();
   void retentionSweep();
   setInterval(() => void retentionSweep(), 24 * 60 * 60 * 1000);
+  void weeklyPricingRefresh();
+  setInterval(() => void weeklyPricingRefresh(), 24 * 60 * 60 * 1000);
   console.log("[WORKER] started");
   process.on("SIGTERM", () => {
     stopped = true;
   });
+}
+
+// Checked daily, run weekly: re-verify allowlist tool pricing against the
+// live vendor pages so "verified on" dates stay honest. The 6-day guard
+// lives in config/global so deploy restarts don't re-run it.
+async function weeklyPricingRefresh(): Promise<void> {
+  try {
+    const { adminDb } = await import("../lib/firebase-admin.js");
+    const { FieldValue } = await import("firebase-admin/firestore");
+    const ref = adminDb().collection("config").doc("global");
+    const last = (await ref.get()).data()?.pricingRefreshAt;
+    const lastMs = last?.toMillis?.() ?? 0;
+    if (Date.now() - lastMs < 6 * 24 * 60 * 60 * 1000) return;
+    await ref.set({ pricingRefreshAt: FieldValue.serverTimestamp() }, { merge: true });
+    const { refreshToolPricing } = await import("../lib/pricing-refresh.js");
+    await refreshToolPricing();
+  } catch (e) {
+    console.error("[PRICING] weekly refresh failed:", e);
+  }
 }
 
 // Published policy: transcripts and audio are deleted 12 months after the

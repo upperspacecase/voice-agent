@@ -135,6 +135,7 @@ export default async function PublicReportPage({ params }: PageProps) {
           workflowLabel: (raw.workflowLabel as string) ?? "",
           statedOutcome: (raw.statedOutcome as string | null) ?? null,
           currentTimeRange: (raw.currentTimeRange as FreeReportData["currentTimeRange"]) ?? null,
+          tasks: (raw.tasks as FreeReportData["tasks"]) ?? [],
           recommendation: rec,
           nextSteps: (raw.nextSteps as string[]) ?? [],
           generatedAt: fmtDate(raw.generatedAt),

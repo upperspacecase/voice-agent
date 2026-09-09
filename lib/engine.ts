@@ -31,6 +31,21 @@ const FLAG_ANNUAL_MAX_USD = 100_000;
 const OUTPUT_SCHEMA = {
   type: Type.OBJECT,
   properties: {
+    tasks: {
+      type: Type.ARRAY,
+      description: "Every distinct task the customer described inside this workflow, up to 6. Only tasks their answers actually mention.",
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          label: { type: Type.STRING, description: "Short task name in the customer's language" },
+          evidenceQuote: { type: Type.STRING, description: "EXACT verbatim phrase from the customer's answers that this task comes from" },
+          timeKnown: { type: Type.BOOLEAN, description: "Did the customer state time for this specific task?" },
+          timeMinHoursPerWeek: { type: Type.NUMBER },
+          timeMaxHoursPerWeek: { type: Type.NUMBER },
+        },
+        required: ["label", "evidenceQuote", "timeKnown", "timeMinHoursPerWeek", "timeMaxHoursPerWeek"],
+      },
+    },
     taskLabel: { type: Type.STRING, description: "The single task worth improving, in the customer's language" },
     currentStateSummary: { type: Type.STRING, description: "One or two sentences summarising the customer's stated process" },
     disposition: { type: Type.STRING, enum: ["keep_human", "automate", "ai", "hand_off", "stop"] },
@@ -47,7 +62,7 @@ const OUTPUT_SCHEMA = {
     nextSteps: { type: Type.ARRAY, items: { type: Type.STRING }, description: "3 short actions for this week" },
   },
   required: [
-    "taskLabel", "currentStateSummary", "disposition", "recommendation",
+    "tasks", "taskLabel", "currentStateSummary", "disposition", "recommendation",
     "toolOrApproach", "setupSteps", "recurringMonthlyCostUsd",
     "recoverableMinHoursPerWeek", "recoverableMaxHoursPerWeek",
     "customerQuotes", "confidenceLevel", "confidenceReason", "agentPrompt",
@@ -55,7 +70,16 @@ const OUTPUT_SCHEMA = {
   ],
 } as const;
 
+interface ModelTask {
+  label: string;
+  evidenceQuote: string;
+  timeKnown: boolean;
+  timeMinHoursPerWeek: number;
+  timeMaxHoursPerWeek: number;
+}
+
 interface ModelOutput {
+  tasks: ModelTask[];
   taskLabel: string;
   currentStateSummary: string;
   disposition: Disposition;
@@ -98,7 +122,8 @@ function buildPrompt(args: {
     "Their answers:",
     obs,
     "",
-    "Select the ONE task inside this workflow where a change creates the most recoverable time for the least setup effort, and produce a recommendation.",
+    "First, map every distinct task the customer described inside this workflow (tasks array) — each MUST carry an exact verbatim evidenceQuote from their answers; a task you cannot quote does not exist. Give per-task time only when the customer stated it for that task; otherwise timeKnown=false.",
+    "Then select the ONE task where a change creates the most recoverable time for the least setup effort, and produce a recommendation. taskLabel must match one of the tasks in the array.",
     "",
     "",
     args.verifiedTools.length
@@ -176,6 +201,35 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
   });
   const out = JSON.parse(result.text ?? "{}") as ModelOutput;
 
+  // ---- Reliability layer: a task exists only if its evidence quote truly
+  // appears in the customer's answers. Everything else is dropped. ----
+  const norm = (x: string) => x.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const haystack = norm(
+    observations
+      .map((o) => `${o.currentProcess} ${o.desiredOutcome ?? ""} ${o.verbatimQuotes.join(" ")}`)
+      .join(" "),
+  );
+  const statedMax = observations[0].timeRange?.maxHoursPerWeek ?? null;
+  const tasks = (out.tasks ?? [])
+    .filter((t) => t.label.trim() && t.evidenceQuote.trim().length >= 12)
+    .filter((t) => haystack.includes(norm(t.evidenceQuote)))
+    .slice(0, 6)
+    .map((t) => {
+      const min = Math.max(0, t.timeMinHoursPerWeek);
+      const max = Math.max(min, t.timeMaxHoursPerWeek);
+      const capped = statedMax != null ? Math.min(max, statedMax) : max;
+      return {
+        label: t.label.trim(),
+        evidenceQuote: t.evidenceQuote.trim(),
+        timeRange: t.timeKnown ? { minHoursPerWeek: Math.min(min, capped), maxHoursPerWeek: capped } : null,
+        examined: false,
+      };
+    });
+  const chosenIdx = tasks.findIndex((t) => norm(t.label) === norm(out.taskLabel));
+  if (chosenIdx >= 0) tasks[chosenIdx].examined = true;
+  else tasks.unshift({ label: out.taskLabel, evidenceQuote: "", timeRange: null, examined: true });
+  const droppedTasks = (out.tasks?.length ?? 0) - tasks.filter((t) => t.evidenceQuote).length;
+
   // ---- Deterministic calculation layer (§10.1) ----
   const stated = observations[0].timeRange ?? null;
   const { range: recoverable, clampedHard } = clampRecoverable(out, stated);
@@ -204,6 +258,7 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
   if ((out.disposition === "automate" || out.disposition === "ai") && !out.toolOrApproach.trim())
     flagReasons.push("automation_without_approach");
   if (out.toolOrApproach.trim() && !verified) flagReasons.push("tool_not_verified");
+  if (droppedTasks >= 2) flagReasons.push("tasks_failed_evidence_check");
   const flagged = flagReasons.length > 0;
 
   const recommendation: EngineRecommendation = {
@@ -263,6 +318,7 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
     workflowLabel: workflow.label,
     statedOutcome: observations[0].desiredOutcome,
     currentTimeRange: stated,
+    tasks,
     recommendation,
     nextSteps: out.nextSteps.slice(0, 3),
     markdown,

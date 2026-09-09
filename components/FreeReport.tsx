@@ -9,6 +9,13 @@
 import { WORKFLOWS } from "@/lib/taxonomy";
 import type { EngineRecommendation, HoursRange } from "@/lib/assessment-schema";
 
+export interface ReportTask {
+  label: string;
+  evidenceQuote: string;
+  timeRange: HoursRange | null;
+  examined: boolean;
+}
+
 export interface FreeReportData {
   shareId: string;
   clientName: string;
@@ -16,6 +23,7 @@ export interface FreeReportData {
   workflowLabel: string;
   statedOutcome: string | null;
   currentTimeRange: HoursRange | null;
+  tasks: ReportTask[];
   recommendation: EngineRecommendation;
   nextSteps: string[];
   generatedAt: string | null;
@@ -108,10 +116,48 @@ export const FreeReport: React.FC<{ data: FreeReportData }> = ({ data }) => {
                   : "you weren't sure — reflected in the confidence below"}
               </div>
               <div className="mt-1.5 text-[13px] leading-snug text-[#6B8199]">
-                Task: {r.taskLabel} · confidence {r.confidence.level}
+                Confidence: {r.confidence.level}
               </div>
             </div>
           </div>
+
+          {data.tasks.length > 0 && (
+            <div className="mt-8 border-t border-[#0B3049]/8 pt-6">
+              <div className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-[#476582]">
+                Tasks you described in this workflow
+              </div>
+              <ul className="space-y-2">
+                {data.tasks.map((t) => (
+                  <li
+                    key={t.label}
+                    className={
+                      t.examined
+                        ? "flex flex-wrap items-baseline justify-between gap-2 rounded-xl border border-[#C05A3E]/30 bg-[#C05A3E]/5 px-4 py-2.5"
+                        : "flex flex-wrap items-baseline justify-between gap-2 px-4 py-2"
+                    }
+                  >
+                    <span className="text-[14px] font-medium">
+                      {t.label}
+                      {t.examined && (
+                        <span className="ml-2 text-[10px] font-bold uppercase tracking-widest text-[#C05A3E]">
+                          The fix below
+                        </span>
+                      )}
+                    </span>
+                    <span className="text-[12.5px] text-[#6B8199]">
+                      {t.timeRange
+                        ? `${t.timeRange.minHoursPerWeek}–${t.timeRange.maxHoursPerWeek} hrs/wk (your estimate)`
+                        : "time not stated"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 px-4 text-[12px] text-[#6B8199]">
+                Drawn from your answers only — a task we couldn&apos;t quote you
+                on isn&apos;t listed.
+              </p>
+            </div>
+          )}
         </section>
 
         {/* Tool shift */}
