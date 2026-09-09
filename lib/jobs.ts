@@ -18,13 +18,14 @@ export interface Job {
   status: JobStatus;
   attempts: number;
   maxAttempts: number;
+  notBefore: Timestamp | null;
   createdAt: Timestamp;
   startedAt: Timestamp | null;
   finishedAt: Timestamp | null;
   lastError: string | null;
 }
 
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 6;
 
 // One job per (type, assessment): re-enqueueing an existing done/failed job
 // resets it, re-enqueueing a queued/running one is a no-op.
@@ -41,6 +42,7 @@ export async function enqueueJob(type: JobType, assessmentId: string): Promise<s
       status: "queued" satisfies JobStatus,
       attempts: 0,
       maxAttempts: MAX_ATTEMPTS,
+      notBefore: null,
       createdAt: FieldValue.serverTimestamp(),
       startedAt: null,
       finishedAt: null,
@@ -61,9 +63,15 @@ export async function claimNextJob(): Promise<{ id: string; job: Job } | null> {
     .limit(10)
     .get();
 
-  const ordered = [...candidates.docs].sort(
-    (x, y) => (x.createTime?.toMillis() ?? 0) - (y.createTime?.toMillis() ?? 0),
-  );
+  // Jobs backing off after a failure carry notBefore; skip them until due so
+  // a provider outage delays work instead of exhausting attempts in seconds.
+  const now = Date.now();
+  const ordered = [...candidates.docs]
+    .filter((d) => {
+      const nb = d.data().notBefore as Timestamp | null | undefined;
+      return !nb || nb.toMillis() <= now;
+    })
+    .sort((x, y) => (x.createTime?.toMillis() ?? 0) - (y.createTime?.toMillis() ?? 0));
 
   for (const doc of ordered) {
     const claimed = await db.runTransaction(async (tx) => {
@@ -98,9 +106,13 @@ export async function failJob(id: string, error: string): Promise<void> {
     const snap = await tx.get(ref);
     const data = snap.data();
     if (!data) return;
-    const exhausted = (data.attempts as number) >= (data.maxAttempts as number);
+    const attempts = data.attempts as number;
+    const exhausted = attempts >= (data.maxAttempts as number);
+    // Exponential backoff, capped at 15 min: attempt 1 -> 1m, 2 -> 4m, 3 -> 9m...
+    const delayMs = Math.min(attempts * attempts * 60_000, 15 * 60_000);
     tx.update(ref, {
       status: (exhausted ? "failed" : "queued") satisfies JobStatus,
+      notBefore: exhausted ? null : Timestamp.fromMillis(Date.now() + delayMs),
       finishedAt: exhausted ? FieldValue.serverTimestamp() : null,
       lastError: error,
     });
