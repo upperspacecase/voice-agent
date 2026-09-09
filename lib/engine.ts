@@ -17,6 +17,7 @@ import type {
 import { logEvent } from "./events";
 import { sendAdminNotification, sendFreeReportDelivery } from "./email";
 import { getVerifiedTools, matchVerifiedTool, type VerifiedTool } from "./tool-allowlist";
+import { verifyGrounding, anchorQuote, normLabel, type VerifiedTask } from "./verify-grounding";
 
 const REPORT_MODEL = process.env.REPORT_MODEL ?? "gemini-3-flash-preview";
 
@@ -201,34 +202,56 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
   });
   const out = JSON.parse(result.text ?? "{}") as ModelOutput;
 
-  // ---- Reliability layer: a task exists only if its evidence quote truly
-  // appears in the customer's answers. Everything else is dropped. ----
-  const norm = (x: string) => x.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-  const haystack = norm(
-    observations
-      .map((o) => `${o.currentProcess} ${o.desiredOutcome ?? ""} ${o.verbatimQuotes.join(" ")}`)
-      .join(" "),
-  );
+  // ---- Reliability layer: semantic grounding, not string matching. An
+  // independent verifier judges each task against everything the customer
+  // said: grounded (shown with an anchored verbatim passage), inferred
+  // (shown, labelled as our inference), unsupported (never ships). ----
+  const sourceText = observations
+    .map((o) =>
+      [o.currentProcess, o.desiredOutcome ?? "", ...o.verbatimQuotes].filter(Boolean).join("\n"),
+    )
+    .join("\n");
+  const candidates = (out.tasks ?? []).filter((t) => t.label.trim()).slice(0, 6);
+  const grounding = await verifyGrounding({
+    sourceText,
+    taskLabels: candidates.map((t) => t.label.trim()),
+    recommendationSummary: `${out.taskLabel}: ${out.recommendation}`,
+  });
+
   const statedMax = observations[0].timeRange?.maxHoursPerWeek ?? null;
-  const tasks = (out.tasks ?? [])
-    .filter((t) => t.label.trim() && t.evidenceQuote.trim().length >= 12)
-    .filter((t) => haystack.includes(norm(t.evidenceQuote)))
-    .slice(0, 6)
-    .map((t) => {
-      const min = Math.max(0, t.timeMinHoursPerWeek);
-      const max = Math.max(min, t.timeMaxHoursPerWeek);
-      const capped = statedMax != null ? Math.min(max, statedMax) : max;
-      return {
-        label: t.label.trim(),
-        evidenceQuote: t.evidenceQuote.trim(),
-        timeRange: t.timeKnown ? { minHoursPerWeek: Math.min(min, capped), maxHoursPerWeek: capped } : null,
-        examined: false,
-      };
+  const tasks: VerifiedTask[] = [];
+  let unsupportedCount = 0;
+  for (const t of candidates) {
+    const verdict = grounding.tasks.get(normLabel(t.label));
+    if (!verdict || verdict.status === "unsupported") {
+      unsupportedCount++;
+      continue;
+    }
+    // Quotes shown to the customer are snapped to their real wording; if no
+    // span anchors, the task survives as "inferred" rather than lying.
+    let status = verdict.status;
+    let support = verdict.support;
+    if (status === "grounded") {
+      const anchored = anchorQuote(verdict.support || t.evidenceQuote, sourceText);
+      if (anchored) support = anchored;
+      else {
+        status = "inferred";
+        support = verdict.support || "Implied by your description of this workflow.";
+      }
+    }
+    const min = Math.max(0, t.timeMinHoursPerWeek);
+    const max = Math.max(min, t.timeMaxHoursPerWeek);
+    const capped = statedMax != null ? Math.min(max, statedMax) : max;
+    tasks.push({
+      label: t.label.trim(),
+      status,
+      support,
+      timeRange: t.timeKnown ? { minHoursPerWeek: Math.min(min, capped), maxHoursPerWeek: capped } : null,
+      examined: false,
     });
-  const chosenIdx = tasks.findIndex((t) => norm(t.label) === norm(out.taskLabel));
+  }
+  const chosenIdx = tasks.findIndex((t) => normLabel(t.label) === normLabel(out.taskLabel));
   if (chosenIdx >= 0) tasks[chosenIdx].examined = true;
-  else tasks.unshift({ label: out.taskLabel, evidenceQuote: "", timeRange: null, examined: true });
-  const droppedTasks = (out.tasks?.length ?? 0) - tasks.filter((t) => t.evidenceQuote).length;
 
   // ---- Deterministic calculation layer (§10.1) ----
   const stated = observations[0].timeRange ?? null;
@@ -258,7 +281,9 @@ export async function generateFreeReport(assessmentId: string): Promise<void> {
   if ((out.disposition === "automate" || out.disposition === "ai") && !out.toolOrApproach.trim())
     flagReasons.push("automation_without_approach");
   if (out.toolOrApproach.trim() && !verified) flagReasons.push("tool_not_verified");
-  if (droppedTasks >= 2) flagReasons.push("tasks_failed_evidence_check");
+  if (unsupportedCount >= 2) flagReasons.push("tasks_unsupported_by_answers");
+  if (chosenIdx < 0) flagReasons.push("chosen_task_not_grounded");
+  if (!grounding.recommendationSupported) flagReasons.push(`recommendation_refuted: ${grounding.recommendationConcern}`.slice(0, 120));
   const flagged = flagReasons.length > 0;
 
   const recommendation: EngineRecommendation = {

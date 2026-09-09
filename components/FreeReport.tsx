@@ -11,7 +11,8 @@ import type { EngineRecommendation, HoursRange } from "@/lib/assessment-schema";
 
 export interface ReportTask {
   label: string;
-  evidenceQuote: string;
+  status: "grounded" | "inferred";
+  support: string; // grounded: their verbatim words; inferred: our reasoning
   timeRange: HoursRange | null;
   examined: boolean;
 }
@@ -132,29 +133,46 @@ export const FreeReport: React.FC<{ data: FreeReportData }> = ({ data }) => {
                     key={t.label}
                     className={
                       t.examined
-                        ? "flex flex-wrap items-baseline justify-between gap-2 rounded-xl border border-[#C05A3E]/30 bg-[#C05A3E]/5 px-4 py-2.5"
-                        : "flex flex-wrap items-baseline justify-between gap-2 px-4 py-2"
+                        ? "rounded-xl border border-[#C05A3E]/30 bg-[#C05A3E]/5 px-4 py-2.5"
+                        : "px-4 py-2"
                     }
                   >
-                    <span className="text-[14px] font-medium">
-                      {t.label}
-                      {t.examined && (
-                        <span className="ml-2 text-[10px] font-bold uppercase tracking-widest text-[#C05A3E]">
-                          The fix below
-                        </span>
-                      )}
-                    </span>
-                    <span className="text-[12.5px] text-[#6B8199]">
-                      {t.timeRange
-                        ? `${t.timeRange.minHoursPerWeek}–${t.timeRange.maxHoursPerWeek} hrs/wk (your estimate)`
-                        : "time not stated"}
-                    </span>
+                    <div className="flex flex-wrap items-baseline justify-between gap-2">
+                      <span className="text-[14px] font-medium">
+                        {t.label}
+                        {t.examined && (
+                          <span className="ml-2 text-[10px] font-bold uppercase tracking-widest text-[#C05A3E]">
+                            The fix below
+                          </span>
+                        )}
+                        {t.status === "inferred" && (
+                          <span className="ml-2 text-[10px] font-semibold uppercase tracking-widest text-[#6B8199]">
+                            Inferred
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-[12.5px] text-[#6B8199]">
+                        {t.timeRange
+                          ? `${t.timeRange.minHoursPerWeek}–${t.timeRange.maxHoursPerWeek} hrs/wk (your estimate)`
+                          : "time not stated"}
+                      </span>
+                    </div>
+                    {t.support && (
+                      <div className="mt-0.5 text-[12px] leading-snug text-[#6B8199]">
+                        {t.status === "grounded" ? (
+                          <>&ldquo;{t.support}&rdquo;</>
+                        ) : (
+                          <>You didn&apos;t say this directly — {t.support}</>
+                        )}
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>
               <p className="mt-2 px-4 text-[12px] text-[#6B8199]">
-                Drawn from your answers only — a task we couldn&apos;t quote you
-                on isn&apos;t listed.
+                Each task shows your own words, or is labelled as our
+                inference. Anything your answers don&apos;t support isn&apos;t
+                listed.
               </p>
             </div>
           )}

@@ -15,7 +15,8 @@
     "assess-cli": "tsx cli/assess-cli.ts",
     "seed:config": "tsx scripts/seed-config.ts",
     "seed:prompt": "tsx scripts/seed-prompt.ts",
-    "worker": "tsx server/worker-main.ts"
+    "worker": "tsx server/worker-main.ts",
+    "eval": "tsx scripts/eval-engine.mts"
   },
   "dependencies": {
     "@google/genai": "^1.50.1",
